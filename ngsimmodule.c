@@ -78,9 +78,24 @@ static double INDEL_FRAC = 0.15;
 static double INDEL_EXTEND = 0.3;
 static double MAX_N_RATIO = 0.05;
 
+static void kstring_copy(kstring_t *dest, kstring_t *src){
+	dest->s = (char*)realloc(dest->s, src->m);
+	strcpy(dest->s, src->s);
+	dest->l = src->l;
+	dest->m = src->m;
+	return;
+}
+
+static inline void kstrings_dealloc(kstring_t *ks, size_t size){
+	for(size_t i=0; i < size; ++i){
+		free((ks + i)->s);
+	}
+	return;
+}
+
 void wgsim_mut_diref(const kseq_t *ks, int is_hap, mutseq_t *hap1, mutseq_t *hap2)
 {
-	int i, deleting = 0;
+	size_t i, deleting = 0;
 	mutseq_t *ret[2];
 
 	ret[0] = hap1; ret[1] = hap2;
@@ -132,12 +147,14 @@ void wgsim_mut_diref(const kseq_t *ks, int is_hap, mutseq_t *hap1, mutseq_t *hap
 			}
 		}
 	}
+	return;
 }
 
 typedef struct {
     PyObject_HEAD
     char *fn;
 		kseq_t *ks;
+		kstring_t *names;
 		size_t total_len, num_ref;
 } FileState;
 
@@ -155,12 +172,13 @@ typedef struct {
 		FileState fstate;
 		Py_ssize_t size, len_l, len_r, std_dev, is_hap, dist;
     size_t buff_size, buff_index, enum_index;
+		size_t *buff_name;
     char* buff_l;
     char* buff_r;
 
 		uint64_t cn_pairs;
 		int cr_len;
-		kstring_t c_refname;
+		size_t cr_count;
     mutseq_t rseq[2];
 } ReadState;
 
@@ -182,7 +200,7 @@ fill_buff(ReadState *rstate){
 			if (rstate->cr_len < rstate->dist + 3 * rstate->std_dev) break;
 
 			rstate->cn_pairs = (uint64_t)((long double)rstate->cr_len / rstate->fstate.total_len * rstate->size + 0.5);
-			rstate->c_refname = rstate->fstate.ks->name;
+			kstring_copy(&rstate->fstate.names[rstate->cr_count++], &rstate->fstate.ks->name);
 			// generate mutations
 			wgsim_mut_diref(rstate->fstate.ks, rstate->is_hap, rstate->rseq, rstate->rseq+1);
 		}
@@ -234,7 +252,7 @@ fill_buff(ReadState *rstate){
 			continue;
 		}
 		j = is_flip? 1: 0;
-		for (i = 0; i < rstate->len_l; ++i){
+		for (i = 0; i < rstate->len_l; i++){
 			c = tmp_seq[j][i];
 			if (c >= 4)
 				c = 4;
@@ -243,7 +261,7 @@ fill_buff(ReadState *rstate){
 			rstate->buff_l[rstate->buff_index  * rstate->len_l + i] = "ACGTN"[c]; 
 		}
 		j = is_flip? 0: 1;
-		for (i = 0; i < rstate->len_r; ++i){
+		for (i = 0; i < rstate->len_r; i++){
 			c = tmp_seq[j][i];
 			if (c >= 4)
 				c = 4;
@@ -251,26 +269,31 @@ fill_buff(ReadState *rstate){
 				c = (c + 1) & 3; // recurrent sequencing errors
 			rstate->buff_r[rstate->buff_index  * rstate->len_r + i] = "ACGTN"[c]; 
 		}
+		rstate->buff_name[rstate->buff_index] = rstate->cr_count - 1;
 		rstate->cn_pairs--;
 		rstate->buff_index++;
 	}
-	rstate->buff_size = rstate->buff_index + 1;
+	free(tmp_seq[0]); free(tmp_seq[1]);
+	rstate->buff_size = rstate->buff_index;
 	rstate->buff_index = 0;
+	return;
 }
 
 static PyObject *
 readgen_new(PyTypeObject *type, PyObject *args, PyObject *kwargs)
 {
     char *fn;
-		int size, len_l, len_r, std_dev, is_hap, dist, buff_size;
+		Py_ssize_t size, x_fold, len_l, len_r, std_dev, is_hap, dist, buff_size;
+		size = 0;
+		x_fold = 0;
 		len_l = len_r = 70;
 		std_dev = 50;
 		dist = 500;
 		buff_size = 10000;
-		static char *kwlist[] = {"fafile", "size", "len_l", "len_r", "std_dev", "dist", "is_hap", "buff_size", NULL};
+		static char *kwlist[] = {"fafile", "size", "x_fold", "len_l", "len_r", "std_dev", "dist", "is_hap", "buff_size", NULL};
 
-		if (!PyArg_ParseTupleAndKeywords(args, kwargs, "si|iiiipi:new", kwlist, 
-					&fn, &size, &len_l, &len_r, &std_dev, &dist, &is_hap, &buff_size)){
+		if (!PyArg_ParseTupleAndKeywords(args, kwargs, "s|iiiiiipi:new", kwlist, 
+					&fn, &size, &x_fold, &len_l, &len_r, &std_dev, &dist, &is_hap, &buff_size)){
         return NULL;
 		}
 		gzFile fp_fa = gzopen(fn, "r");
@@ -284,6 +307,17 @@ readgen_new(PyTypeObject *type, PyObject *args, PyObject *kwargs)
 		kseq_destroy(ks);
 		gzclose(fp_fa);
 
+		if ((size == 0) && (x_fold == 0)){
+			PyErr_SetString(PyExc_TypeError, "Need either a size of reads simulated or the x fold");
+			return NULL;
+		}
+
+		if (x_fold != 0){
+			if (size != 0)
+				PyErr_WarnEx(PyExc_Warning, "The size calculated with x fold precedes the argued size", 1);
+			size = (Py_ssize_t)((long double)tot_len / (len_l + len_r) * x_fold); 
+		}
+		if (buff_size > size) buff_size = size;
     /* Create a new ReadState and initialize its state - pointing to the last
      * index in the sequence.
     */
@@ -294,6 +328,7 @@ readgen_new(PyTypeObject *type, PyObject *args, PyObject *kwargs)
 		rstate->fstate.total_len = tot_len;
 		rstate->fstate.num_ref = n_ref;
 		rstate->fstate.ks = kseq_init(gzopen(fn, "r"));
+		rstate->fstate.names = (kstring_t *)calloc(n_ref, sizeof(kstring_t)); 
 		rstate->size = size;
 		rstate->len_l = len_l;
 		rstate->len_r = len_r;
@@ -303,6 +338,8 @@ readgen_new(PyTypeObject *type, PyObject *args, PyObject *kwargs)
 		rstate->buff_size = buff_size;
 		rstate->enum_index = 0;
 		rstate->buff_index = 0;
+		rstate->cn_pairs = rstate->cr_len = rstate->cr_count = 0;
+		rstate->buff_name = (size_t *)calloc(buff_size+2, sizeof(size_t)); 
 		rstate->buff_l = (char *)calloc(len_l*(buff_size+2), sizeof(char)); 
 		rstate->buff_r = (char *)calloc(len_r*(buff_size+2), sizeof(char)); 
 
@@ -317,7 +354,8 @@ readgen_dealloc(ReadState *rstate)
     /* We need XDECREF here because when the generator is exhausted,
      * rgstate->sequence is cleared with Py_CLEAR which sets it to NULL.
     */
-		free(rstate->buff_l); free(rstate->buff_r);
+		kstrings_dealloc(rstate->fstate.names, rstate->fstate.num_ref);
+		free(rstate->buff_name);free(rstate->buff_l); free(rstate->buff_r);
     Py_TYPE(rstate)->tp_free(rstate);
 }
 
@@ -329,12 +367,14 @@ readgen_next(ReadState *rstate)
      * Returning NULL in this case is enough. The next() builtin will raise the
      * StopIteration error for us.
     */
-  //if ((rstate->size >= 0) & ((l = kseq_read(ks)) >= 0)) {
 	if ((rstate->enum_index < rstate->size)){
 		if ((rstate->buff_index >= rstate->buff_size)){
 			fill_buff(rstate);
 		}
-		PyObject *result = Py_BuildValue("s#s#", rstate->c_refname.s, rstate->c_refname.l, rstate->buff_l + (rstate->buff_index * rstate->len_l), rstate->len_l);
+		PyObject *result = Py_BuildValue("s#s#s#", rstate->fstate.names[rstate->buff_name[rstate->buff_index]].s, 
+				rstate->fstate.names[rstate->buff_name[rstate->buff_index]].l,
+				rstate->buff_l + (rstate->buff_index * rstate->len_l), rstate->len_l,
+				rstate->buff_r + (rstate->buff_index * rstate->len_r), rstate->len_r);
 		rstate->buff_index++;
     rstate->enum_index++;
     return result;
