@@ -197,13 +197,19 @@ fill_buff(ReadState *rstate){
 		if (rstate->cn_pairs == 0){
 			if((rstate->cr_len = kseq_read(rstate->fstate.ks)) < 0) break;
 			// Skip sequence as it is shorter
-			if (rstate->cr_len < rstate->dist + 3 * rstate->std_dev) break;
 
 			rstate->cn_pairs = (uint64_t)((long double)rstate->cr_len / rstate->fstate.total_len * rstate->size + 0.5);
+			if (rstate->cn_pairs == 0) continue;
+			if (rstate->cr_len < rstate->dist + 3 * rstate->std_dev){
+				rstate->cn_pairs = 0;
+				continue;
+			}
+
 			kstring_copy(&rstate->fstate.names[rstate->cr_count++], &rstate->fstate.ks->name);
 			// generate mutations
 			wgsim_mut_diref(rstate->fstate.ks, rstate->is_hap, rstate->rseq, rstate->rseq+1);
 		}
+		//fprintf(stderr, "[%s] buff_index %lu buff_size %lu cn_pairs %lu\n", __func__, rstate->buff_index, rstate->buff_size, rstate->cn_pairs);
 		do { // avoid boundary failure
 			ran = ran_normal() * rstate->std_dev + rstate->dist;
 			d = (size_t)(ran + 0.5);
@@ -274,7 +280,7 @@ fill_buff(ReadState *rstate){
 		rstate->buff_index++;
 	}
 	free(tmp_seq[0]); free(tmp_seq[1]);
-	rstate->buff_size = rstate->buff_index;
+	rstate->buff_size = (rstate->cr_len < 0)? rstate->buff_index: rstate->buff_size;
 	rstate->buff_index = 0;
 	return;
 }
